@@ -6,13 +6,13 @@ import {WrappedOpinionToken} from "../src/WrappedOpinionToken.sol";
 
 contract WrappedOpinionTokenTest is Test {
     WrappedOpinionToken public token;
-    address public owner = makeAddr("owner");
-    address public bridge = makeAddr("bridge");
-    address public user = makeAddr("user");
-    address public opinionContract = makeAddr("opinionContract");
-    address public attacker = makeAddr("attacker");
 
-    address constant OPINION_CONTRACT = address(0xBEEF);
+    address public owner           = makeAddr("owner");
+    address public bridge          = makeAddr("bridge");
+    address public user            = makeAddr("user");
+    address public opinionContract = makeAddr("opinionContract");
+    address public attacker        = makeAddr("attacker");
+
     uint256 constant OPINION_TOKEN_ID = 42;
 
     function setUp() public {
@@ -23,7 +23,7 @@ contract WrappedOpinionTokenTest is Test {
         token.setBridge(bridge);
     }
 
-    // ─── Mint ───
+    // ─── Mint ─────────────────────────────────────────────────────────────────
 
     function test_mint_success() public {
         vm.prank(bridge);
@@ -41,6 +41,19 @@ contract WrappedOpinionTokenTest is Test {
 
         assertEq(token.balanceOf(user, OPINION_TOKEN_ID), 800);
         assertEq(token.totalSupply(OPINION_TOKEN_ID), 800);
+    }
+
+    function test_mint_differentTokenIds() public {
+        vm.startPrank(bridge);
+        token.mint(user, OPINION_TOKEN_ID, 500);
+        token.mint(user, OPINION_TOKEN_ID + 1, 300);
+        vm.stopPrank();
+
+        // IDs are tracked independently
+        assertEq(token.balanceOf(user, OPINION_TOKEN_ID), 500);
+        assertEq(token.balanceOf(user, OPINION_TOKEN_ID + 1), 300);
+        assertEq(token.totalSupply(OPINION_TOKEN_ID), 500);
+        assertEq(token.totalSupply(OPINION_TOKEN_ID + 1), 300);
     }
 
     function test_mint_revertNotBridge() public {
@@ -61,7 +74,7 @@ contract WrappedOpinionTokenTest is Test {
         token.mint(user, OPINION_TOKEN_ID, 0);
     }
 
-    // ─── Burn ───
+    // ─── Burn ─────────────────────────────────────────────────────────────────
 
     function test_burn_success() public {
         vm.prank(bridge);
@@ -74,6 +87,17 @@ contract WrappedOpinionTokenTest is Test {
         assertEq(token.totalSupply(OPINION_TOKEN_ID), 600);
     }
 
+    function test_burn_all() public {
+        vm.prank(bridge);
+        token.mint(user, OPINION_TOKEN_ID, 1000);
+
+        vm.prank(bridge);
+        token.burn(user, OPINION_TOKEN_ID, 1000);
+
+        assertEq(token.balanceOf(user, OPINION_TOKEN_ID), 0);
+        assertEq(token.totalSupply(OPINION_TOKEN_ID), 0);
+    }
+
     function test_burn_revertNotBridge() public {
         vm.prank(bridge);
         token.mint(user, OPINION_TOKEN_ID, 100);
@@ -81,6 +105,15 @@ contract WrappedOpinionTokenTest is Test {
         vm.prank(attacker);
         vm.expectRevert(WrappedOpinionToken.OnlyBridge.selector);
         token.burn(user, OPINION_TOKEN_ID, 50);
+    }
+
+    function test_burn_revertZeroAmount() public {
+        vm.prank(bridge);
+        token.mint(user, OPINION_TOKEN_ID, 100);
+
+        vm.prank(bridge);
+        vm.expectRevert(WrappedOpinionToken.ZeroAmount.selector);
+        token.burn(user, OPINION_TOKEN_ID, 0);
     }
 
     function test_burn_revertInsufficientBalance() public {
@@ -92,13 +125,26 @@ contract WrappedOpinionTokenTest is Test {
         token.burn(user, OPINION_TOKEN_ID, 200);
     }
 
-    // ─── Admin ───
+    // ─── Admin ────────────────────────────────────────────────────────────────
 
-    function test_setBridge_revertsIfAlreadySet() public {     
-        vm.prank(owner);   
+    function test_setBridge_success() public {
+        // Deploy a fresh token with no bridge set yet
+        vm.prank(owner);
+        WrappedOpinionToken freshToken = new WrappedOpinionToken(owner, opinionContract);
+
+        assertEq(freshToken.bridge(), address(0));
+
+        vm.prank(owner);
+        freshToken.setBridge(bridge);
+
+        assertEq(freshToken.bridge(), bridge);
+    }
+
+    function test_setBridge_revertsIfAlreadySet() public {
+        // bridge is already set in setUp()
+        vm.prank(owner);
         vm.expectRevert(WrappedOpinionToken.BridgeAlreadySet.selector);
-        token.setBridge(makeAddr("anotherBridge")); // should revert
-        vm.stopPrank();
+        token.setBridge(makeAddr("anotherBridge"));
     }
 
     function test_setBridge_revertNotOwner() public {

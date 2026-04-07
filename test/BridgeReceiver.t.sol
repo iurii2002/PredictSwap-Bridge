@@ -13,55 +13,65 @@ contract BridgeReceiverTest is Test {
     MockEndpointV2 public polyEndpoint;
     bytes32 public escrowPeer;
 
-    address public owner = makeAddr("owner");
-    address public user = makeAddr("user");
+    address public owner         = makeAddr("owner");
+    address public user          = makeAddr("user");
     address public opinionEscrow = makeAddr("opinionEscrow");
     address public opinionContract = makeAddr("opinionContract");
 
-    uint32 constant BSC_EID = 30102;
-    uint32 constant POLYGON_EID = 30109;
-
-    address constant OPINION_CONTRACT = address(0xBEEF);
+    uint32 constant BSC_EID         = 30102;
+    uint32 constant POLYGON_EID     = 30109;
     uint256 constant OPINION_TOKEN_ID = 42;
-    
-        // options
+
     bytes public _option = abi.encodePacked(
         uint16(0x0003),
         uint8(0x01),
         uint16(0x0011),
         uint8(0x01),
-        uint128(200_000)
+        uint128(400_000)  // matches enforced floor
     );
 
     function setUp() public {
         polyEndpoint = new MockEndpointV2(POLYGON_EID);
-        
+
         vm.startPrank(owner);
         wrappedToken = new WrappedOpinionToken(owner, opinionContract);
-        receiver = new BridgeReceiver(address(polyEndpoint), owner, address(wrappedToken), BSC_EID);
+        receiver     = new BridgeReceiver(address(polyEndpoint), owner, address(wrappedToken), BSC_EID);
+        escrowPeer   = bytes32(uint256(uint160(opinionEscrow)));
 
-        escrowPeer = bytes32(uint256(uint160(opinionEscrow)));  // precomputed once
-
-        // Authorize receiver as the bridge on WrappedOpinionToken
         wrappedToken.setBridge(address(receiver));
-
-        // Set OpinionEscrow as trusted peer on BSC
         receiver.setPeer(BSC_EID, escrowPeer);
+        receiver.setDstGasLimit(400_000);
+        receiver.unpause();
         vm.stopPrank();
 
         vm.deal(user, 10 ether);
     }
 
-    // ─── Receive Lock (mint) ───
+    // ─── Helpers ──────────────────────────────────────────────────────────────
+
+    /// @dev Simulate a bridge-in LZ message, minting wrapped tokens to _to.
+    function _mintWrappedTokens(address _to, uint256 _amount) internal {
+        bytes memory payload = abi.encode(_to, OPINION_TOKEN_ID, _amount);
+        vm.prank(address(polyEndpoint));
+        receiver.lzReceive(
+            Origin({srcEid: BSC_EID, sender: escrowPeer, nonce: 1}),
+            keccak256("guid"),
+            payload,
+            address(0),
+            ""
+        );
+    }
+
+    // ─── Receive Lock (mint) ──────────────────────────────────────────────────
 
     function test_lzReceive_mintsWrappedTokens() public {
-        bytes memory lockPayload = abi.encode(user, OPINION_TOKEN_ID, uint256(1000));
+        bytes memory payload = abi.encode(user, OPINION_TOKEN_ID, uint256(1000));
 
         vm.prank(address(polyEndpoint));
         receiver.lzReceive(
             Origin({srcEid: BSC_EID, sender: escrowPeer, nonce: 1}),
             keccak256("guid"),
-            lockPayload,
+            payload,
             address(0),
             ""
         );
@@ -97,23 +107,20 @@ contract BridgeReceiverTest is Test {
 
     function test_lzReceive_differentRecipients() public {
         address alice = makeAddr("alice");
-        address bob = makeAddr("bob");
-
-        bytes memory payloadAlice = abi.encode(alice, OPINION_TOKEN_ID, uint256(600));
-        bytes memory payloadBob = abi.encode(bob, OPINION_TOKEN_ID, uint256(400));
+        address bob   = makeAddr("bob");
 
         vm.startPrank(address(polyEndpoint));
         receiver.lzReceive(
             Origin({srcEid: BSC_EID, sender: escrowPeer, nonce: 1}),
             keccak256("guid1"),
-            payloadAlice,
+            abi.encode(alice, OPINION_TOKEN_ID, uint256(600)),
             address(0),
             ""
         );
         receiver.lzReceive(
             Origin({srcEid: BSC_EID, sender: escrowPeer, nonce: 2}),
             keccak256("guid2"),
-            payloadBob,
+            abi.encode(bob, OPINION_TOKEN_ID, uint256(400)),
             address(0),
             ""
         );
@@ -121,12 +128,13 @@ contract BridgeReceiverTest is Test {
 
         assertEq(wrappedToken.balanceOf(alice, OPINION_TOKEN_ID), 600);
         assertEq(wrappedToken.balanceOf(bob, OPINION_TOKEN_ID), 400);
+        assertEq(receiver.totalBridged(OPINION_TOKEN_ID), 1000);
     }
 
     function test_lzReceive_revertNotEndpoint() public {
-        bytes memory payload = abi.encode(user, OPINION_CONTRACT, OPINION_TOKEN_ID, uint256(100));
+        bytes memory payload = abi.encode(user, OPINION_TOKEN_ID, uint256(100));
 
-        vm.prank(user);
+        vm.prank(user); // not the endpoint
         vm.expectRevert(abi.encodeWithSignature("OnlyEndpoint(address)", user));
         receiver.lzReceive(
             Origin({srcEid: BSC_EID, sender: escrowPeer, nonce: 1}),
@@ -137,19 +145,44 @@ contract BridgeReceiverTest is Test {
         );
     }
 
-    // ─── Bridge Back (burn + send unlock) ───
+    function test_lzReceive_revertNotPeer() public {
+        // Mint first so _lzReceive body is reachable — peer check fires before body
+        // but we need valid state to confirm it's peer that's rejecting, not something else
+        bytes memory payload = abi.encode(user, OPINION_TOKEN_ID, uint256(100));
+        bytes32 fakePeer = bytes32(uint256(uint160(makeAddr("fakeSender"))));
 
-    function _mintWrappedTokens(address _to, uint256 _amount) internal {
-        bytes memory lockPayload = abi.encode(_to, OPINION_TOKEN_ID, _amount);
         vm.prank(address(polyEndpoint));
+        vm.expectRevert(); // OnlyPeer
         receiver.lzReceive(
-            Origin({srcEid: BSC_EID, sender: escrowPeer, nonce: 1}),
+            Origin({srcEid: BSC_EID, sender: fakePeer, nonce: 1}), // ← untrusted sender
             keccak256("guid"),
-            lockPayload,
+            payload,
             address(0),
             ""
         );
     }
+
+    function test_lzReceive_succeedsWhenPaused() public {
+        // _lzReceive is intentionally not gated by pause —
+        // in-flight BSC → Polygon messages must always land
+        vm.prank(owner);
+        receiver.pause();
+
+        bytes memory payload = abi.encode(user, OPINION_TOKEN_ID, uint256(1000));
+        vm.prank(address(polyEndpoint));
+        receiver.lzReceive(
+            Origin({srcEid: BSC_EID, sender: escrowPeer, nonce: 1}),
+            keccak256("guid"),
+            payload,
+            address(0),
+            ""
+        );
+
+        assertEq(wrappedToken.balanceOf(user, OPINION_TOKEN_ID), 1000);
+        assertEq(receiver.totalBridged(OPINION_TOKEN_ID), 1000);
+    }
+
+    // ─── Bridge Back (burn + send unlock) ─────────────────────────────────────
 
     function test_bridgeBack_success() public {
         _mintWrappedTokens(user, 1000);
@@ -159,11 +192,8 @@ contract BridgeReceiverTest is Test {
         vm.prank(user);
         receiver.bridgeBack{value: 0.01 ether}(OPINION_TOKEN_ID, 400, bscRecipient, _option);
 
-        // Wrapped tokens burned
         assertEq(wrappedToken.balanceOf(user, OPINION_TOKEN_ID), 600);
         assertEq(receiver.totalBridged(OPINION_TOKEN_ID), 600);
-
-        // LZ message sent
         assertEq(polyEndpoint.messageCount(), 1);
     }
 
@@ -197,19 +227,43 @@ contract BridgeReceiverTest is Test {
         receiver.bridgeBack{value: 0.01 ether}(OPINION_TOKEN_ID, 100, address(0), _option);
     }
 
-    function test_bridgeBack_revertInsufficientBalance() public {
+    function test_bridgeBack_revertInsufficientBridged() public {
+        // totalBridged[id]=100, requesting 200 → InsufficientBridgedBalance fires
+        // before ERC1155 burn is ever reached
         _mintWrappedTokens(user, 100);
 
         vm.prank(user);
-        vm.expectRevert(); // ERC1155 burn insufficient balance
+        vm.expectRevert(abi.encodeWithSelector(
+            BridgeReceiver.InsufficientBridgedBalance.selector,
+            OPINION_TOKEN_ID,
+            uint256(100), // totalBridged
+            uint256(200)  // requested
+        ));
         receiver.bridgeBack{value: 0.01 ether}(OPINION_TOKEN_ID, 200, makeAddr("bsc"), _option);
     }
 
-    // ─── Config ───
+    function test_bridgeBack_revertWhenPaused() public {
+        _mintWrappedTokens(user, 1000);
+
+        vm.prank(owner);
+        receiver.pause();
+
+        vm.prank(user);
+        vm.expectRevert();
+        receiver.bridgeBack{value: 0.01 ether}(OPINION_TOKEN_ID, 100, makeAddr("bsc"), _option);
+    }
+
+    // ─── Config ───────────────────────────────────────────────────────────────
 
     function test_setDstGasLimit() public {
         vm.prank(owner);
-        receiver.setDstGasLimit(300_000);
-        assertEq(receiver.dstGasLimit(), 300_000);
+        receiver.setDstGasLimit(500_000);
+        assertEq(receiver.dstGasLimit(), 500_000);
+    }
+
+    function test_setDstGasLimit_revertNotOwner() public {
+        vm.prank(user);
+        vm.expectRevert();
+        receiver.setDstGasLimit(500_000);
     }
 }
