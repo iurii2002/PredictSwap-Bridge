@@ -35,7 +35,7 @@ contract DeployBSC is Script {
         address owner         = vm.envAddress("OWNER_ADDRESS");
         address opinionContract = vm.envAddress("OPINION_CONTRACT");
         uint32  polygonEid    = uint32(vm.envUint("POLYGON_EID"));
-        uint128 dstGasLimit   = 200000;
+        uint128 dstGasLimit   = uint128(vm.envUint("DST_GAS_LIMIT"));
 
         vm.startBroadcast(deployerKey);
 
